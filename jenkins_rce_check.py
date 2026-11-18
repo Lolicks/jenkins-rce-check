@@ -45,6 +45,32 @@ def emit(msg):
         print(msg, flush=True)
 
 
+NO_COLOR = bool(os.environ.get("NO_COLOR"))
+VERDICT_COLORS = {
+    "rce_confirmed": "91",
+    "script_console_anonymous_proof_failed": "93",
+    "script_console_anonymous_unverified": "93",
+    "no_anonymous_script_console": "92",
+    "not_jenkins": "90",
+}
+
+
+def paint(text, code):
+    if NO_COLOR:
+        return text
+    return "\033[%sm%s\033[0m" % (code, text)
+
+
+def vcolor(verdict):
+    return VERDICT_COLORS.get(verdict, "97")
+
+
+def link(url):
+    if NO_COLOR:
+        return url
+    return "\033]8;;%s\033\\%s\033]8;;\033\\" % (url, paint(url, "91"))
+
+
 def normalize(target):
     target = target.strip()
     if not re.match(r"^https?://", target, re.I):
@@ -242,19 +268,30 @@ def main():
                         f.write(json.dumps(result, ensure_ascii=False) + "\n")
             prefix = "[%d/%d] " % (i + 1, len(targets)) if batch else ""
             emit("%sRESULT %s  %s  version=%s  proof=%s" % (
-                prefix, result["url"], result["verdict"], result["version"] or "-",
-                (result["proof"] or "-")[:60].replace("\n", " ")))
+                prefix, result["url"], paint(result["verdict"], vcolor(result["verdict"])),
+                result["version"] or "-", (result["proof"] or "-")[:60].replace("\n", " ")))
             if not batch:
                 emit("Отчёт: %s" % out)
 
     emit("\n=== ИТОГИ ===")
     for i, r in enumerate(results, 1):
-        emit("%2d. %-30s %-38s %s" % (i, r["url"], r["verdict"], r["version"] or "-"))
+        emit("%2d. %-30s %s %s" % (
+            i, r["url"], paint(r["verdict"], vcolor(r["verdict"])), r["version"] or "-"))
+    counts = Counter(r["verdict"] for r in results)
+    for verdict in ("rce_confirmed", "script_console_anonymous_proof_failed",
+                    "no_anonymous_script_console", "not_jenkins"):
+        n = counts.pop(verdict, 0)
+        if not n:
+            continue
+        emit("  %s: %s" % (paint(verdict, vcolor(verdict)), n))
+        if verdict == "rce_confirmed":
+            for r in results:
+                if r["verdict"] == verdict:
+                    emit("    -> %s" % link(r["url"]))
+    for verdict, n in counts.items():
+        emit("  %s: %s" % (paint(verdict, vcolor(verdict)), n))
     if batch:
         emit("\nСводка: %s" % batch_out)
-        counts = Counter(r["verdict"] for r in results)
-        for verdict, n in counts.most_common():
-            emit("  %s %s" % (n, verdict))
     return 0
 
 
