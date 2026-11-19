@@ -1,0 +1,19 @@
+[package]
+name = "jenkins-rce-check"
+version = "0.1.0"
+edition = "2021"
+description = "Fast parallel Jenkins RCE checker (Rust port)"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
