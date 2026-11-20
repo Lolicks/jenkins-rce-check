@@ -85,6 +85,21 @@ jenkins-rce-check.exe jenkins.example.com:8080 -c whoami --nonce abc123
 $env:NO_COLOR=1; jenkins-rce-check.exe -l targets.txt -o results.jsonl | Tee-Object run.log
 ```
 
+### Интерактивный шелл
+
+После подтверждения RCE можно открыть шелл на любой цели из `found.txt`:
+
+```
+# меню -> п.3) Интерактивный шелл (из found.txt) -> номер хоста
+# или напрямую:
+jenkins-rce-check.exe --shell http://jenkins.example.com:8080
+```
+
+Команда и вывод передаются через Groovy в base64 (кавычки, `$` и переводы строк
+не ломают скрипт). Тип оболочки определяется по `os.name`: `cmd /c` на Windows,
+`/bin/sh -c` на Unix. Внутри шелла: `/exit` — выход, `/help` — справка.
+Если crumb протух, он обновляется автоматически.
+
 ### jq
 
 ```powershell
