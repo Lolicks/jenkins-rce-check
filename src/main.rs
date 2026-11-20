@@ -639,8 +639,10 @@ async fn post_script(
     rl: &RateLimiter,
 ) -> Resp {
     let mut headers = HeaderMap::new();
-    if let Ok(v) = HeaderValue::from_str(crumb) {
-        headers.insert("Jenkins-Crumb", v);
+    if !crumb.is_empty() {
+        if let Ok(v) = HeaderValue::from_str(crumb) {
+            headers.insert("Jenkins-Crumb", v);
+        }
     }
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
     headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
@@ -912,10 +914,12 @@ async fn check_target(
                 }
             }
             if crumb.is_empty() {
-                log_line(&mut logs, &prefix, "  crumb=failed");
-                break;
+                // CSRF может быть выключен: crumb-эндпоинт есть, но crumb не нужен.
+                // Всё равно пробуем POST — валидация proof отсечёт мусор.
+                log_line(&mut logs, &prefix, "  crumb=failed -> POST без crumb (CSRF off?)");
+            } else {
+                log_line(&mut logs, &prefix, &format!("  crumb=ok ({})", if attempt == 0 { "wave" } else { "retry" }));
             }
-            log_line(&mut logs, &prefix, &format!("  crumb=ok ({})", if attempt == 0 { "wave" } else { "retry" }));
 
             let out = post_script(
                 &client,
