@@ -1086,7 +1086,10 @@ async fn check_target(
     let script_lower = r_script.body.to_ascii_lowercase();
     let mut script_anon =
         script_lower.contains("name=\"script\"") || script_lower.contains("name='script'");
-    if !script_anon && codes[1] == 200 && r_script_text.body.to_ascii_lowercase().contains("script") {
+    let script_text_lower = r_script_text.body.to_ascii_lowercase();
+    if !script_anon && codes[1] == 200
+        && (script_text_lower.contains("name=\"script\"") || script_text_lower.contains("name='script'"))
+    {
         script_anon = true;
     }
     log_line(&mut logs, &prefix, &format!("  anonymous_script_console={script_anon}"));
