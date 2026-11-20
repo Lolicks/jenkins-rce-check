@@ -210,11 +210,15 @@ fn configure_groovy(config: &mut Config) {
 // Детерминированный proof: токен генерируется локально, а цель должна вернуть
 // его же, выполнив echo. Страница 403 или кэш такой токенподделать не могут.
 fn groovy_verify(nonce: &str) -> String {
-    let token = format!("{PROOF_MARKER}_{nonce}:{nonce}");
+    // Полный токен намеренно отсутствует в исходнике: honeypot может отразить
+    // отправленный скрипт, но не собранную во время исполнения строку.
+    let mid = nonce.len() / 2;
+    let (a, b) = nonce.split_at(mid);
     format!(
-        "def os = System.getProperty('os.name').toLowerCase(); \
-         def p = os.contains('windows') ? ['cmd','/c','echo {token}'].execute() \
-                                        : ['/bin/sh','-c','echo {token}'].execute(); \
+        "def t = '{PROOF_MARKER}_{a}' + '{b}:' + '{a}' + '{b}'; \
+         def os = System.getProperty('os.name').toLowerCase(); \
+         def p = os.contains('windows') ? ['cmd','/c','echo ' + t].execute() \
+                                        : ['/bin/sh','-c','echo ' + t].execute(); \
          return new String(p.getInputStream().bytes, 'UTF-8')"
     )
 }
@@ -1491,9 +1495,11 @@ mod tests {
 
     #[test]
     fn verify_mode_needs_exact_token_and_2xx() {
-        let nonce = "abc123";
+        let nonce = "abcdef1234567890";
         let token = format!("{PROOF_MARKER}_{nonce}:{nonce}");
-        assert!(groovy_verify(nonce).contains(&token));
+        let src = groovy_verify(nonce);
+        assert!(!src.contains(&token), "полный токен не должен быть в исходнике скрипта");
+        assert!(src.contains(&nonce[..8]) && src.contains(&nonce[8..]));
         let err = resp(403, "<html><pre>Error 403 No valid crumb was included</pre></html>");
         assert!(validate_verify(&err, nonce, true).is_none());
         let ok_body = format!("<html><pre>{token}</pre></html>");
